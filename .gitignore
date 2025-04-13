@@ -50,3 +50,85 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Harness specific
+.harness/
+.terraform/
+.harness-cache/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+.terraform.lock.hcl
+terraform.tfvars.json
+.terraformrc
+terraform.rc
+
+# JMeter
+jmeter.log
+*.jtl
+test-output/
+jmeter/results/
+jmeter/dashboard/
+
+# Security
+*.pem
+*.key
+*.crt
+.env
+vault.json
+wiz-credentials.json
+seeker.conf
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# Logs
+*.log
+logs/
+test-results/
+reports/
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Temp files
+*.tmp
+*.bak
+*.backup
+.temp/
+tmp/
+
+# Dependencies
+node_modules/
+vendor/
+.virtualenv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+dist/
+build/
+out/
+target/
+
+# Local development
+local.yaml
+override.yaml
+*.local.yaml
