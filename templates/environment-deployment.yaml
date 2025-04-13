@@ -1,0 +1,278 @@
+template:
+  name: environment-deployment
+  identifier: environment_deployment
+  type: Stage
+  spec:
+    variables:
+      - name: environment
+        type: String
+        required: true
+      - name: workspace
+        type: String
+        required: true
+      - name: requireApproval
+        type: Boolean
+        default: false
+      - name: minApprovers
+        type: Number
+        default: 1
+      - name: jmeterUsers
+        type: Number
+        default: 10
+        description: "Number of concurrent users for load test"
+      - name: jmeterRampUp
+        type: Number
+        default: 60
+        description: "Ramp-up period in seconds"
+      - name: jmeterDuration
+        type: Number
+        default: 300
+        description: "Test duration in seconds"
+      - name: jmeterP95Threshold
+        type: Number
+        default: 2000
+        description: "95th percentile response time threshold in milliseconds"
+      - name: jmeterErrorThreshold
+        type: Number
+        default: 1
+        description: "Maximum allowed error rate percentage"
+    
+    stage:
+      name: <+variables.environment>
+      identifier: <+variables.environment>
+      description: <+variables.environment> environment deployment
+      type: Deployment
+      spec:
+        serviceConfig:
+          serviceRef: <+input>
+          serviceDefinition:
+            type: Terraform
+            spec:
+              configuration:
+                type: TerraformCloud
+                spec:
+                  workspace: <+variables.workspace>
+                  organizationId: <+org.variables.TF_CLOUD_ORG>
+        infrastructure:
+          environmentRef: <+variables.environment>
+          infrastructureDefinition:
+            type: TerraformCloud
+            spec:
+              workspace: <+variables.workspace>
+              organizationId: <+org.variables.TF_CLOUD_ORG>
+        execution:
+          steps:
+            - step:
+                name: Vault Authentication
+                identifier: vault_auth
+                type: HarnessApproval
+                spec:
+                  execution:
+                    steps:
+                      - step:
+                          type: Shell
+                          name: Get Vault Token
+                          identifier: get_vault_token
+                          spec:
+                            shell: Bash
+                            command: |
+                              export VAULT_TOKEN=$(curl -X POST -H "X-Vault-Request: true" -d '{"role_id":"${VAULT_ROLE_ID}","secret_id":"${VAULT_SECRET_ID}"}' ${VAULT_ADDR}/v1/auth/approle/login | jq -r '.auth.client_token')
+                              harness secret update VAULT_TOKEN_<+variables.environment> -v $VAULT_TOKEN
+
+            - step:
+                name: Get AWS Credentials
+                identifier: get_aws_creds
+                type: Shell
+                spec:
+                  command: |
+                    export AWS_CREDS=$(curl -H "X-Vault-Token: ${VAULT_TOKEN_<+variables.environment>}" ${VAULT_ADDR}/v1/aws/creds/terraform-role)
+                    harness secret update AWS_ACCESS_KEY_<+variables.environment> -v $(echo $AWS_CREDS | jq -r '.data.access_key')
+                    harness secret update AWS_SECRET_KEY_<+variables.environment> -v $(echo $AWS_CREDS | jq -r '.data.secret_key')
+
+            - step:
+                name: Terraform Plan
+                identifier: terraform_plan
+                type: TerraformPlan
+                spec:
+                  configuration:
+                    type: TerraformCloud
+                    workspace: <+variables.workspace>
+                    varFiles:
+                      - <+variables.environment>.tfvars
+                  environmentVariables:
+                    - name: AWS_ACCESS_KEY_ID
+                      value: <+secrets.getValue("AWS_ACCESS_KEY_<+variables.environment>")>
+                    - name: AWS_SECRET_ACCESS_KEY
+                      value: <+secrets.getValue("AWS_SECRET_KEY_<+variables.environment>")>
+
+            - step:
+                name: WIZ IaC Scan
+                identifier: wiz_scan
+                type: Run
+                spec:
+                  command: |
+                    wiz-cli auth --id ${WIZ_CLIENT_ID} --secret ${WIZ_CLIENT_SECRET}
+                    wiz-cli iac scan -p terraform.tfplan --policy policy.yaml
+
+            - step:
+                name: Terraform Apply
+                identifier: terraform_apply
+                type: TerraformApply
+                spec:
+                  configuration:
+                    type: TerraformCloud
+                    workspace: <+variables.workspace>
+
+            - step:
+                name: Seeker Security Scan
+                identifier: seeker_scan
+                type: Plugin
+                spec:
+                  connectorRef: seeker
+                  image: seeker-agent:latest
+                  command: |
+                    seeker-agent scan --url ${APP_URL} --project ${PROJECT_NAME}
+
+            - step:
+                name: Setup JMeter Test Resources
+                identifier: setup_jmeter_resources
+                type: Run
+                spec:
+                  command: |
+                    # Create directories for JMeter artifacts
+                    mkdir -p jmeter/tests jmeter/results
+
+                    # Copy test plans and supporting files
+                    cp load-tests/<+variables.environment>/*.jmx jmeter/tests/
+                    cp load-tests/<+variables.environment>/test-data/* jmeter/tests/ || true
+                    
+                    # Validate test plan exists
+                    if [ ! -f "jmeter/tests/load-test.jmx" ]; then
+                      echo "Error: JMeter test plan not found"
+                      exit 1
+
+            - step:
+                name: JMeter Load Test
+                identifier: jmeter_test
+                type: Plugin
+                spec:
+                  connectorRef: jmeter
+                  image: jmeter:latest
+                  command: |
+                    # Set JMeter properties
+                    export JVM_ARGS="-Xmx1024m -Djava.security.egd=file:/dev/urandom"
+                    export JMETER_OPTS="-Jjmeter.save.saveservice.timestamp_format=yyyy-MM-dd HH:mm:ss"
+                    
+                    # Run JMeter test with comprehensive settings
+                    jmeter \
+                      -n \
+                      -t jmeter/tests/load-test.jmx \
+                      -l jmeter/results/results.jtl \
+                      -e -o jmeter/results/dashboard \
+                      -Jusers=<+variables.jmeterUsers|10> \
+                      -Jrampup=<+variables.jmeterRampUp|60> \
+                      -Jduration=<+variables.jmeterDuration|300> \
+                      -Jtarget_env=<+variables.environment> \
+                      -Jbase_url=${APP_URL} \
+                      -Jthreads.group1.threads=<+variables.jmeterUsers|10> \
+                      -Jthreads.group1.rampup=<+variables.jmeterRampUp|60> \
+                      -Jjmeter.save.saveservice.timestamp_format=yyyy-MM-dd HH:mm:ss \
+                      -Jjmeter.save.saveservice.output_format=csv \
+                      -Jjmeter.save.saveservice.response_data=false \
+                      -Jjmeter.save.saveservice.samplerData=false \
+                      -Jjmeter.save.saveservice.requestHeaders=false \
+                      -Jjmeter.save.saveservice.responseHeaders=false \
+                      || exit 1
+
+            - step:
+                name: Analyze Load Test Results
+                identifier: analyze_load_test
+                type: Run
+                failureStrategies:
+                  - onFailure:
+                      errors:
+                        - AllErrors
+                      action:
+                        type: StageRollback
+                spec:
+                  command: |
+                    # Run analysis script with error handling
+                    if [ -f "jmeter/results/results.jtl" ]; then
+                      python analyze_sla.py \
+                        --results-file jmeter/results/results.jtl \
+                        --environment <+variables.environment> \
+                        --threshold-p95 <+variables.jmeterP95Threshold|2000> \
+                        --threshold-error-rate <+variables.jmeterErrorThreshold|1>
+                      
+                      # Check exit code and set barrier variables
+                      if [ $? -eq 0 ]; then
+                        echo "Load test passed all thresholds"
+                        harness workflow variable set LOAD_TEST_STATUS "passed"
+                      else
+                        echo "Load test failed to meet performance thresholds"
+                        harness workflow variable set LOAD_TEST_STATUS "failed"
+                        exit 1
+                      fi
+                    else
+                      echo "Error: JMeter results file not found"
+                      harness workflow variable set LOAD_TEST_STATUS "failed"
+                      exit 1
+                    fi
+
+            - step:
+                name: Verify Performance Gate
+                identifier: verify_performance_gate
+                type: Barrier
+                spec:
+                  execution:
+                    steps:
+                      - step:
+                          type: Shell
+                          name: Check Performance Results
+                          identifier: check_performance
+                          spec:
+                            shell: Bash
+                            command: |
+                              if [ "<+workflow.variables.LOAD_TEST_STATUS>" = "failed" ]; then
+                                echo "Performance gate check failed - Load test results did not meet thresholds"
+                                exit 1
+                              else
+                                echo "Performance gate check passed"
+                              fi
+                barrier:
+                  name: Performance Gate
+                  dependencies:
+                    - analyze_load_test
+                  propagateFailure: true
+                  evaluateConditions:
+                    - condition: <+workflow.variables.LOAD_TEST_STATUS> == "passed"
+                      message: "Load test results meet performance requirements"
+                    
+            - step:
+                name: Upload Test Results
+                identifier: upload_test_results
+                type: Upload
+                spec:
+                  files:
+                    - jmeter/results/**/*
+                  connectorRef: artifacts_connector
+                  metadata:
+                    environment: <+variables.environment>
+                    testType: performance
+                    timestamp: ${PIPELINE_EXECUTION_ID}
+
+        preDeploymentSteps:
+          - step:
+              name: Deployment Approval
+              identifier: deployment_approval
+              type: HarnessApproval
+              spec:
+                approvalMessage: Please review and approve deployment
+                includePipelineExecutor: true
+                approvers:
+                  userGroups:
+                    - <+variables.environment>-approvers
+                  minimumCount: <+variables.minApprovers>
+                  disallowPipelineExecutor: <+variables.requireApproval>
+              when:
+                condition: <+variables.requireApproval> == true

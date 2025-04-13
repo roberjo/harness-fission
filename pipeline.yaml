@@ -1,0 +1,41 @@
+pipeline:
+  name: multi-env-terraform-deployment
+  identifier: multi_env_terraform_deployment
+  description: Pipeline for multi-environment deployment with Terraform, security scanning, and performance testing
+  tags: {}
+  stages:
+    - template:
+        name: Development
+        templateRef: templates/environment-deployment.yaml
+        variables:
+          environment: Development
+          workspace: dev-workspace
+          requireApproval: false
+          minApprovers: 1
+
+    - template:
+        name: QA
+        templateRef: templates/environment-deployment.yaml
+        variables:
+          environment: QA
+          workspace: qa-workspace
+          requireApproval: false
+          minApprovers: 1
+
+    - template:
+        name: Test
+        templateRef: templates/environment-deployment.yaml
+        variables:
+          environment: Test
+          workspace: test-workspace
+          requireApproval: false
+          minApprovers: 1
+
+    - template:
+        name: Production
+        templateRef: templates/environment-deployment.yaml
+        variables:
+          environment: Production
+          workspace: prod-workspace
+          requireApproval: true
+          minApprovers: 2
