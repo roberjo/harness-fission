@@ -36,7 +36,35 @@ template:
         type: Number
         default: 1
         description: "Maximum allowed error rate percentage"
-    
+      - name: sonarQubeGateTimeout
+        type: Number
+        default: 300
+        description: "Timeout in seconds for SonarQube quality gate"
+      - name: zapThreshold
+        type: String
+        default: "MEDIUM"
+        description: "Minimum severity level for ZAP findings to fail the pipeline"
+      - name: snykSeverity
+        type: String
+        default: "high"
+        description: "Minimum severity level for Snyk findings to fail the pipeline"
+      - name: unitTestCoverage
+        type: Number
+        default: 80
+        description: "Minimum unit test coverage percentage required"
+      - name: testResultPath
+        type: String
+        default: "test-results"
+        description: "Path to store test results"
+      - name: notificationChannels
+        type: String
+        default: "slack,email"
+        description: "Comma-separated list of notification channels"
+      - name: monitoringDuration
+        type: Number
+        default: 900
+        description: "Post-deployment monitoring duration in seconds"
+
     stage:
       name: <+variables.environment>
       identifier: <+variables.environment>
@@ -90,6 +118,102 @@ template:
                     harness secret update AWS_SECRET_KEY_<+variables.environment> -v $(echo $AWS_CREDS | jq -r '.data.secret_key')
 
             - step:
+                name: SonarQube Analysis
+                identifier: sonar_scan
+                type: Plugin
+                spec:
+                  connectorRef: sonarqube
+                  image: sonarsource/sonar-scanner-cli:latest
+                  command: |
+                    sonar-scanner \
+                      -Dsonar.projectKey=${PROJECT_NAME} \
+                      -Dsonar.sources=. \
+                      -Dsonar.host.url=${SONAR_HOST_URL} \
+                      -Dsonar.login=${SONAR_TOKEN}
+
+            - step:
+                name: SonarQube Quality Gate
+                identifier: sonar_gate
+                type: Barrier
+                spec:
+                  execution:
+                    steps:
+                      - step:
+                          type: Plugin
+                          name: Check Quality Gate
+                          identifier: check_quality_gate
+                          spec:
+                            connectorRef: sonarqube
+                            image: curlimages/curl:latest
+                            command: |
+                              ANALYSIS_ID=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/ce/component?component=${PROJECT_NAME}" | jq -r '.current.id')
+                              STATUS=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}" | jq -r '.projectStatus.status')
+                              if [ "$STATUS" != "OK" ]; then
+                                echo "Quality gate failed with status: $STATUS"
+                                exit 1
+                  barrier:
+                    name: Quality Gate
+                    timeout: <+variables.sonarQubeGateTimeout>
+
+            - step:
+                name: Container Image Scan
+                identifier: trivy_scan
+                type: Plugin
+                spec:
+                  connectorRef: docker
+                  image: aquasec/trivy:latest
+                  command: |
+                    trivy image ${APP_IMAGE} \
+                      --exit-code 1 \
+                      --severity HIGH,CRITICAL \
+                      --no-progress
+
+            - step:
+                name: Dependency Security Scan
+                identifier: snyk_scan
+                type: Plugin
+                spec:
+                  connectorRef: snyk
+                  image: snyk/snyk:latest
+                  command: |
+                    snyk test \
+                      --severity-threshold=<+variables.snykSeverity> \
+                      --all-projects
+
+            - step:
+                name: Run Unit Tests
+                identifier: unit_tests
+                type: Run
+                failureStrategies:
+                  - onFailure:
+                      errors: [AllErrors]
+                      action: StageRollback
+                spec:
+                  command: |
+                    # Run tests with coverage
+                    pytest --cov=src --cov-report=xml --cov-report=html --junitxml=unit-tests.xml
+                    
+                    # Check coverage threshold
+                    COVERAGE=$(coverage report | grep TOTAL | awk '{print $4}' | sed 's/%//')
+                    if [ "${COVERAGE}" -lt "<+variables.unitTestCoverage>" ]; then
+                      echo "Coverage ${COVERAGE}% below threshold of <+variables.unitTestCoverage>%"
+                      exit 1
+                    fi
+
+            - step:
+                name: Integration Tests
+                identifier: integration_tests
+                type: Run
+                spec:
+                  command: |
+                    # Run integration tests
+                    newman run collections/integration-tests.json \
+                      --environment environments/<+variables.environment>.json \
+                      --reporters cli,junit,htmlextra \
+                      --reporter-junit-export integration-tests.xml \
+                      --reporter-htmlextra-export integration-report.html
+
+            - step:
                 name: Terraform Plan
                 identifier: terraform_plan
                 type: TerraformPlan
@@ -122,6 +246,24 @@ template:
                   configuration:
                     type: TerraformCloud
                     workspace: <+variables.workspace>
+
+            - step:
+                name: OWASP ZAP Scan
+                identifier: zap_scan
+                type: Plugin
+                spec:
+                  connectorRef: docker
+                  image: owasp/zap2docker-stable:latest
+                  command: |
+                    zap-baseline.py \
+                      -t ${APP_URL} \
+                      -c gen.conf \
+                      -I \
+                      -l WARN \
+                      -T 10 \
+                      -m 5 \
+                      --hook=/zap/auth.py \
+                      --auto
 
             - step:
                 name: Seeker Security Scan
@@ -249,6 +391,28 @@ template:
                       message: "Load test results meet performance requirements"
                     
             - step:
+                name: Aggregate Test Results
+                identifier: test_results
+                type: Run
+                spec:
+                  command: |
+                    mkdir -p <+variables.testResultPath>/<+variables.environment>
+                    
+                    # Copy all test results
+                    cp unit-tests.xml <+variables.testResultPath>/<+variables.environment>/
+                    cp -r htmlcov <+variables.testResultPath>/<+variables.environment>/coverage
+                    cp integration-tests.xml <+variables.testResultPath>/<+variables.environment>/
+                    cp integration-report.html <+variables.testResultPath>/<+variables.environment>/
+                    cp -r jmeter/results/* <+variables.testResultPath>/<+variables.environment>/performance/
+                    
+                    # Generate summary report
+                    python scripts/generate_test_summary.py \
+                      --unit-test unit-tests.xml \
+                      --integration-test integration-tests.xml \
+                      --performance-test jmeter/results/results.jtl \
+                      --output <+variables.testResultPath>/<+variables.environment>/summary.html
+
+            - step:
                 name: Upload Test Results
                 identifier: upload_test_results
                 type: Upload
@@ -260,6 +424,71 @@ template:
                     environment: <+variables.environment>
                     testType: performance
                     timestamp: ${PIPELINE_EXECUTION_ID}
+
+            - step:
+                name: Upload Test Reports
+                identifier: upload_reports
+                type: Upload
+                spec:
+                  files:
+                    - <+variables.testResultPath>/<+variables.environment>/**/*
+                  connectorRef: artifacts_connector
+                  metadata:
+                    environment: <+variables.environment>
+                    buildNumber: ${PIPELINE_EXECUTION_ID}
+                    testTypes: "unit,integration,performance"
+
+            - step:
+                name: Post-Deployment Health Check
+                identifier: health_check
+                type: Plugin
+                spec:
+                  connectorRef: prometheus
+                  image: prom/prometheus:latest
+                  command: |
+                    # Monitor application metrics
+                    promql-cli query --host ${PROMETHEUS_URL} \
+                      --duration ${monitoringDuration}s \
+                      --step 15s \
+                      --output json \
+                      'sum(rate(http_request_duration_seconds_count{env="<+variables.environment>"}[5m])) by (status_code)' > metrics.json
+
+                    # Analyze results
+                    python scripts/analyze_metrics.py \
+                      --input metrics.json \
+                      --error-threshold 0.01 \
+                      --latency-threshold 0.5
+
+            - step:
+                name: Send Notifications
+                identifier: notifications
+                type: Notification
+                spec:
+                  type: Pipeline
+                  spec:
+                    users: ${NOTIFICATION_USERS}
+                    userGroups: 
+                      - <+variables.environment>-notifications
+                    channels: <+variables.notificationChannels>
+                    template:
+                      subject: "Deployment to <+variables.environment> - ${PIPELINE_STATUS}"
+                      body: |
+                        Deployment Status: ${PIPELINE_STATUS}
+                        Environment: <+variables.environment>
+                        Build: ${PIPELINE_EXECUTION_ID}
+                        
+                        Test Results:
+                        - Unit Tests: ${UNIT_TEST_STATUS}
+                        - Integration Tests: ${INTEGRATION_TEST_STATUS}
+                        - Load Tests: ${LOAD_TEST_STATUS}
+                        
+                        Security Results:
+                        - OWASP ZAP: ${ZAP_STATUS}
+                        - Snyk: ${SNYK_STATUS}
+                        - Seeker: ${SEEKER_STATUS}
+                        
+                        For detailed reports, visit:
+                        ${HARNESS_URL}/pipeline/${PIPELINE_ID}/execution/${PIPELINE_EXECUTION_ID}
 
         preDeploymentSteps:
           - step:
@@ -276,3 +505,25 @@ template:
                   disallowPipelineExecutor: <+variables.requireApproval>
               when:
                 condition: <+variables.requireApproval> == true
+
+        rollbackSteps:
+          - step:
+              name: Notify Rollback
+              identifier: rollback_notification
+              type: Notification
+              spec:
+                type: Pipeline
+                spec:
+                  users: ${NOTIFICATION_USERS}
+                  userGroups: 
+                    - <+variables.environment>-notifications
+                  channels: <+variables.notificationChannels>
+                  template:
+                    subject: "⚠️ Rollback in <+variables.environment>"
+                    body: |
+                      Deployment was rolled back in <+variables.environment>
+                      Build: ${PIPELINE_EXECUTION_ID}
+                      Reason: ${ROLLBACK_REASON}
+                      
+                      Please check the pipeline logs for details:
+                      ${HARNESS_URL}/pipeline/${PIPELINE_ID}/execution/${PIPELINE_EXECUTION_ID}
